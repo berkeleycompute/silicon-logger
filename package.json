@@ -16,7 +16,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@aws-sdk/client-lambda": "^3.0.0"
+    "@aws-sdk/client-lambda": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0"
   },
   "optionalDependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",

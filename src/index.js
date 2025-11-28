@@ -20,12 +20,33 @@ try {
   InvokeCommand = null;
 }
 
+// Try to load AWS SDK v3 for SSM (optional - will gracefully degrade if not available)
+let SSMClient, GetParameterCommand;
+try {
+  const ssmSdk = require('@aws-sdk/client-ssm');
+  SSMClient = ssmSdk.SSMClient;
+  GetParameterCommand = ssmSdk.GetParameterCommand;
+} catch (error) {
+  // AWS SDK v3 SSM not available - SSM parameter retrieval will be disabled
+  SSMClient = null;
+  GetParameterCommand = null;
+}
+
 /**
  * Logger class for structured logging to Splunk
  * @example
+ * // With explicit endpoint
  * const logger = new Logger({
  *   endpoint: 'arn:aws:lambda:us-east-1:123456789:function:splunk-intake',
  *   apiKey: 'your-api-key',
+ *   environment: 'dev',
+ *   source: 'My Application'
+ * });
+ * 
+ * // With AWS credentials - ARN will be retrieved from SSM
+ * const logger = new Logger({
+ *   accessKeyId: 'your-access-key',
+ *   secretAccessKey: 'your-secret-key',
  *   environment: 'dev',
  *   source: 'My Application'
  * });
@@ -36,7 +57,7 @@ class Logger {
   /**
    * Create a new Logger instance
    * @param {object} config - Logger configuration
-   * @param {string} config.endpoint - Splunk Lambda ARN (e.g., "arn:aws:lambda:...") or HTTP POST URL (e.g., "https://...")
+   * @param {string} [config.endpoint] - Splunk Lambda ARN (e.g., "arn:aws:lambda:...") or HTTP POST URL (e.g., "https://..."). If not provided and AWS credentials are available, will retrieve from SSM Parameter Store.
    * @param {string} [config.accessKeyId] - AWS access key ID (for Lambda ARN, optional, can use env var AWS_ACCESS_KEY_ID)
    * @param {string} [config.secretAccessKey] - AWS secret access key (for Lambda ARN, optional, can use env var AWS_SECRET_ACCESS_KEY)
    * @param {string} [config.apiKey] - For Lambda: "accessKeyId:secretAccessKey" format. For HTTP URL: x-api-key header value
@@ -50,11 +71,10 @@ class Logger {
    * @param {function} [config.getGeolocation] - Custom function to get geolocation from IP
    */
   constructor(config) {
-    if (!config || !config.endpoint) {
-      throw new Error('Logger requires an endpoint (Splunk Lambda ARN or HTTP POST URL)');
+    if (!config) {
+      throw new Error('Logger requires a config object');
     }
 
-    this.endpoint = config.endpoint;
     this.environment = config.environment || process.env.ENV || 'unknown';
     this.source = config.source || 'Silicon Logger';
     this.region = config.region || process.env.AWS_REGION || 'us-east-1';
@@ -65,16 +85,60 @@ class Logger {
     this.defaultEvent = config.event || null;
     this.defaultContext = config.context || null;
 
-    // Detect if endpoint is an ARN or URL
-    this.isLambdaArn = this.endpoint.startsWith('arn:aws:lambda:');
-    this.isHttpUrl = this.endpoint.startsWith('http://') || this.endpoint.startsWith('https://');
-
-    if (!this.isLambdaArn && !this.isHttpUrl) {
-      throw new Error('Endpoint must be either a Lambda ARN (arn:aws:lambda:...) or an HTTP URL (http://... or https://...)');
+    // AWS credentials - from constructor, apiKey, or environment variables
+    let accessKeyId = null;
+    let secretAccessKey = null;
+    
+    if (config.apiKey) {
+      // Parse apiKey in format "accessKeyId:secretAccessKey"
+      const parts = config.apiKey.split(':');
+      if (parts.length === 2) {
+        accessKeyId = parts[0];
+        secretAccessKey = parts[1];
+      } else {
+        // Single value - treat as access key ID only
+        accessKeyId = config.apiKey;
+        secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
+      }
+    } else {
+      accessKeyId = config.accessKeyId || process.env.AWS_ACCESS_KEY_ID || null;
+      secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
     }
 
+    // Check if we have AWS credentials
+    const hasAwsCredentials = accessKeyId || secretAccessKey || 
+                              process.env.AWS_ACCESS_KEY_ID || 
+                              process.env.AWS_SECRET_ACCESS_KEY ||
+                              process.env.AWS_SESSION_TOKEN; // Support IAM roles with session tokens
+
+    // Set endpoint - either provided, or will be retrieved from SSM if AWS credentials are available
+    this.endpoint = config.endpoint || null;
+    this.hasEndpoint = !!this.endpoint;
+
+    // If endpoint is not provided, we'll try to retrieve from SSM if AWS credentials are available
+    if (!this.endpoint && hasAwsCredentials) {
+      // Endpoint will be retrieved lazily from SSM when needed
+      this.endpointPromise = null;
+      this.endpointResolved = false;
+    } else if (!this.endpoint) {
+      throw new Error('Logger requires either an endpoint (Splunk Lambda ARN or HTTP POST URL) or AWS credentials to retrieve from SSM Parameter Store');
+    } else {
+      this.endpointPromise = null;
+      this.endpointResolved = true;
+    }
+
+    // Detect if endpoint is an ARN or URL (will be determined after endpoint is resolved)
+    this.isLambdaArn = false;
+    this.isHttpUrl = false;
+
+    // Store AWS credentials
+    this.accessKeyId = accessKeyId;
+    this.secretAccessKey = secretAccessKey;
+
     // For HTTP URLs, use x-api-key
-    if (this.isHttpUrl) {
+    this.xApiKey = null;
+    if (this.endpoint && (this.endpoint.startsWith('http://') || this.endpoint.startsWith('https://'))) {
+      this.isHttpUrl = true;
       this.xApiKey = config.xApiKey || config.apiKey || process.env.X_API_KEY || null;
       if (!this.xApiKey) {
         throw new Error('HTTP endpoint requires x-api-key (provide via xApiKey, apiKey config, or X_API_KEY env var)');
@@ -82,25 +146,10 @@ class Logger {
       // Clear AWS credentials for HTTP mode
       this.accessKeyId = null;
       this.secretAccessKey = null;
-    } else {
-      // For Lambda ARN, use AWS credentials
-      this.xApiKey = null;
-      // AWS credentials - from constructor, apiKey, or environment variables
-      if (config.apiKey) {
-        // Parse apiKey in format "accessKeyId:secretAccessKey"
-        const parts = config.apiKey.split(':');
-        if (parts.length === 2) {
-          this.accessKeyId = parts[0];
-          this.secretAccessKey = parts[1];
-        } else {
-          // Single value - treat as access key ID only
-          this.accessKeyId = config.apiKey;
-          this.secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
-        }
-      } else {
-        this.accessKeyId = config.accessKeyId || process.env.AWS_ACCESS_KEY_ID || null;
-        this.secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
-      }
+    } else if (this.endpoint && this.endpoint.startsWith('arn:aws:lambda:')) {
+      this.isLambdaArn = true;
+    } else if (this.endpoint) {
+      throw new Error('Endpoint must be either a Lambda ARN (arn:aws:lambda:...) or an HTTP URL (http://... or https://...)');
     }
 
     // Request-scoped sensitive paths storage
@@ -112,6 +161,10 @@ class Logger {
     // Splunk Lambda client and configuration (lazy-loaded, only for Lambda ARN)
     this.splunkLambdaClient = null;
     this.splunkLambdaClientPromise = null;
+
+    // SSM client for retrieving Lambda ARN (lazy-loaded)
+    this.ssmClient = null;
+    this.ssmClientPromise = null;
   }
 
   /**
@@ -997,6 +1050,128 @@ class Logger {
   }
 
   /**
+   * Get SSM client with credentials from constructor or environment variables
+   * @returns {Promise<SSMClient|null>} SSM client or null if not available
+   */
+  async getSSMClient() {
+    if (this.ssmClient) {
+      return this.ssmClient;
+    }
+
+    if (this.ssmClientPromise) {
+      return this.ssmClientPromise;
+    }
+
+    if (!SSMClient || !GetParameterCommand) {
+      return null;
+    }
+
+    this.ssmClientPromise = (async () => {
+      try {
+        // Use credentials from constructor or environment variables
+        const accessKeyId = this.accessKeyId;
+        const secretAccessKey = this.secretAccessKey;
+
+        // Build client config
+        const clientConfig = {
+          region: this.region,
+        };
+
+        // If explicit credentials are provided, use them
+        if (accessKeyId && secretAccessKey) {
+          clientConfig.credentials = {
+            accessKeyId: accessKeyId,
+            secretAccessKey: secretAccessKey,
+          };
+        }
+        // Otherwise, try to use default AWS credentials (from IAM role, ~/.aws/credentials, etc.)
+
+        this.ssmClient = new SSMClient(clientConfig);
+        return this.ssmClient;
+      } catch (error) {
+        console.error('Failed to create SSM client:', error);
+        return null;
+      }
+    })();
+
+    return this.ssmClientPromise;
+  }
+
+  /**
+   * Retrieve intake Lambda ARN from SSM Parameter Store
+   * @returns {Promise<string|null>} Lambda ARN or null if not found
+   */
+  async getIntakeLambdaArnFromSSM() {
+    try {
+      const ssmClient = await this.getSSMClient();
+      if (!ssmClient) {
+        console.error('SSM client not available - cannot retrieve Lambda ARN from SSM');
+        return null;
+      }
+
+      const parameterName = '/silicon/splunk/intake-lambda-arn';
+      const command = new GetParameterCommand({
+        Name: parameterName,
+      });
+
+      const response = await ssmClient.send(command);
+      
+      if (response.Parameter && response.Parameter.Value) {
+        return response.Parameter.Value;
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Failed to retrieve Lambda ARN from SSM:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Ensure endpoint is resolved (either already set or retrieved from SSM)
+   * @returns {Promise<string>} Resolved endpoint ARN or URL
+   */
+  async ensureEndpointResolved() {
+    // If endpoint is already set and resolved, return it
+    if (this.endpoint && this.endpointResolved) {
+      return this.endpoint;
+    }
+
+    // If we're already resolving, wait for that promise
+    if (this.endpointPromise) {
+      return this.endpointPromise;
+    }
+
+    // Start resolving from SSM
+    this.endpointPromise = (async () => {
+      if (!this.endpoint) {
+        // Retrieve from SSM
+        const arn = await this.getIntakeLambdaArnFromSSM();
+        if (!arn) {
+          throw new Error('Failed to retrieve intake Lambda ARN from SSM Parameter Store (/silicon/splunk/intake-lambda-arn)');
+        }
+        this.endpoint = arn;
+        
+        // Detect if it's a Lambda ARN or HTTP URL
+        if (this.endpoint.startsWith('arn:aws:lambda:')) {
+          this.isLambdaArn = true;
+          this.isHttpUrl = false;
+        } else if (this.endpoint.startsWith('http://') || this.endpoint.startsWith('https://')) {
+          this.isLambdaArn = false;
+          this.isHttpUrl = true;
+        } else {
+          throw new Error(`Retrieved endpoint from SSM is not a valid Lambda ARN or HTTP URL: ${this.endpoint}`);
+        }
+      }
+
+      this.endpointResolved = true;
+      return this.endpoint;
+    })();
+
+    return this.endpointPromise;
+  }
+
+  /**
    * Get Splunk Lambda client with credentials from constructor or environment variables
    * @returns {Promise<LambdaClient|null>} Lambda client or null if not available
    */
@@ -1055,6 +1230,9 @@ class Logger {
     // Fire-and-forget - don't block the main execution
     (async () => {
       try {
+        // Ensure endpoint is resolved (either already set or retrieved from SSM)
+        const endpoint = await this.ensureEndpointResolved();
+
         // Transform log entry to Splunk format
         const splunkEntry = this.transformToSplunkFormat(logEntry);
 
@@ -1070,7 +1248,7 @@ class Logger {
 
           // Send as single log (intake function can handle both single and batch)
           const command = new InvokeCommand({
-            FunctionName: this.endpoint,
+            FunctionName: endpoint,
             InvocationType: 'Event', // Asynchronous invocation (fire-and-forget)
             Payload: JSON.stringify(splunkEntry),
           });
@@ -1090,9 +1268,11 @@ class Logger {
    * @returns {Promise<void>}
    */
   async sendToHttpEndpoint(splunkEntry) {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       try {
-        const url = new URL(this.endpoint);
+        // Ensure endpoint is resolved
+        const endpoint = await this.ensureEndpointResolved();
+        const url = new URL(endpoint);
         const isHttps = url.protocol === 'https:';
         const httpModule = isHttps ? https : http;
 
