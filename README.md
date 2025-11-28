@@ -362,6 +362,67 @@ Set request metadata (IP, geolocation, etc.) for a request. Should be called bef
 #### `logger.cleanupRequest(requestId)`
 Clean up request metadata after request completes.
 
+#### `logger.logRequest(request, context, getGeolocation)`
+Log the initial request. Handles both Lambda events and Express request objects.
+
+- **`request`**: Lambda event object, Express request object, or `{ event, context }` format
+- **`context`**: Lambda context object (optional, only used if request is a Lambda event)
+- **`getGeolocation`**: Optional async function to get geolocation from IP: `(ip, requestContext) => Promise<object>`
+
+**Example - Lambda:**
+```javascript
+exports.handler = async (event, context) => {
+  const logger = new Logger({ endpoint: '...', event, context });
+  await logger.logRequest(event, context);
+  // ... rest of handler
+};
+```
+
+**Example - Express:**
+```javascript
+app.use(async (req, res, next) => {
+  const logger = new Logger({ endpoint: '...' });
+  await logger.logRequest(req);
+  next();
+});
+```
+
+#### `logger.logResponse(request, context, statusCode, responseBody)`
+Log the response. Handles both Lambda events and Express request objects.
+
+- **`request`**: Lambda event object, Express request object, or `{ event, context }` format
+- **`context`**: Lambda context object (optional, only used if request is a Lambda event)
+- **`statusCode`**: HTTP status code (e.g., 200, 404, 500)
+- **`responseBody`**: Response body to log (will be masked appropriately)
+
+**Example - Lambda:**
+```javascript
+exports.handler = async (event, context) => {
+  const logger = new Logger({ endpoint: '...', event, context });
+  await logger.logRequest(event, context);
+  
+  const result = { data: { message: 'Success' } };
+  await logger.logResponse(event, context, 200, result);
+  return { statusCode: 200, body: JSON.stringify(result) };
+};
+```
+
+**Example - Express:**
+```javascript
+app.use(async (req, res, next) => {
+  const logger = new Logger({ endpoint: '...' });
+  await logger.logRequest(req);
+  
+  const originalSend = res.send;
+  res.send = function(body) {
+    logger.logResponse(req, null, res.statusCode, body);
+    return originalSend.call(this, body);
+  };
+  
+  next();
+});
+```
+
 #### `logger.createBoundLogger(requestContext, defaultSensitivePaths)`
 Create a bound logger instance with default request context and sensitive paths. Returns a logger object with the same methods but without needing to pass request context each time.
 
