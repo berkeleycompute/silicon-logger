@@ -1263,7 +1263,7 @@ class Logger {
   }
 
   /**
-   * Send log entry to HTTP POST endpoint with x-api-key header
+   * Send log entry to HTTP POST endpo int with x-api-key header
    * @param {object} splunkEntry - Transformed log entry
    * @returns {Promise<void>}
    */
