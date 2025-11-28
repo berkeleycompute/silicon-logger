@@ -13,7 +13,9 @@ npm install @silicon/logger
 ```javascript
 const Logger = require('@silicon/logger');
 
-// Create a logger instance with explicit credentials
+// === Using AWS Lambda ARN (with AWS credentials) ===
+
+// Create a logger instance with explicit AWS credentials
 const logger = new Logger({
   endpoint: 'arn:aws:lambda:us-east-1:123456789:function:splunk-intake',
   accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
@@ -31,10 +33,37 @@ const logger2 = new Logger({
   source: 'My Application'
 });
 
-// Or use apiKey format
+// Or use apiKey format for AWS credentials
 const logger3 = new Logger({
   endpoint: process.env.SPLUNK_LAMBDA_ARN,
   apiKey: 'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  environment: 'dev',
+  source: 'My Application'
+});
+
+// === Using HTTP POST URL (with x-api-key) ===
+
+// Create a logger instance with HTTP POST endpoint
+const logger4 = new Logger({
+  endpoint: 'https://api.example.com/logs',
+  xApiKey: 'your-api-key-here',
+  environment: 'dev',
+  source: 'My Application'
+});
+
+// Or use environment variable
+// X_API_KEY=your-api-key-here
+const logger5 = new Logger({
+  endpoint: process.env.SPLUNK_HTTP_ENDPOINT,
+  xApiKey: process.env.X_API_KEY,
+  environment: 'dev',
+  source: 'My Application'
+});
+
+// Or use apiKey parameter (works for both Lambda and HTTP)
+const logger6 = new Logger({
+  endpoint: 'https://api.example.com/logs',
+  apiKey: 'your-api-key-here', // For HTTP endpoints, this is used as x-api-key
   environment: 'dev',
   source: 'My Application'
 });
@@ -49,13 +78,14 @@ logger.info('User logged in', { userId: '123' });
 
 ```javascript
 const logger = new Logger({
-  endpoint: string,              // Required: Splunk Lambda ARN or endpoint URL
-  accessKeyId: string,            // Optional: AWS access key ID (or use AWS_ACCESS_KEY_ID env var)
-  secretAccessKey: string,        // Optional: AWS secret access key (or use AWS_SECRET_ACCESS_KEY env var)
-  apiKey: string,                 // Optional: API key in format "accessKeyId:secretAccessKey" (alternative to separate params)
+  endpoint: string,              // Required: Splunk Lambda ARN (arn:aws:lambda:...) or HTTP POST URL (http://... or https://...)
+  accessKeyId: string,            // Optional: AWS access key ID (for Lambda ARN, or use AWS_ACCESS_KEY_ID env var)
+  secretAccessKey: string,        // Optional: AWS secret access key (for Lambda ARN, or use AWS_SECRET_ACCESS_KEY env var)
+  apiKey: string,                 // Optional: For Lambda: "accessKeyId:secretAccessKey" format. For HTTP: x-api-key header value
+  xApiKey: string,                // Optional: x-api-key header value for HTTP POST endpoints (alternative to apiKey for URLs)
   environment: string,            // Optional: Environment name (default: 'unknown')
   source: string,                 // Optional: Source system identifier (default: 'Silicon Logger')
-  region: string,                 // Optional: AWS region (default: 'us-east-1' or AWS_REGION env var)
+  region: string,                 // Optional: AWS region for Lambda ARN (default: 'us-east-1' or AWS_REGION env var)
   getClientIp: function,          // Optional: Custom function to extract client IP
   getGeolocation: function,       // Optional: Custom function to get geolocation from IP
 });
@@ -63,16 +93,25 @@ const logger = new Logger({
 
 ### Required Parameters
 
-- **`endpoint`**: The Splunk Lambda ARN (e.g., `arn:aws:lambda:us-east-1:123456789:function:splunk-intake`) or endpoint URL
+- **`endpoint`**: 
+  - **Lambda ARN**: The Splunk Lambda ARN (e.g., `arn:aws:lambda:us-east-1:123456789:function:splunk-intake`)
+  - **HTTP URL**: The HTTP POST endpoint URL (e.g., `https://api.example.com/logs`)
 
 ### Optional Parameters
 
+#### For Lambda ARN endpoints:
 - **`accessKeyId`**: AWS access key ID. If not provided, will use `AWS_ACCESS_KEY_ID` environment variable or default AWS credentials.
 - **`secretAccessKey`**: AWS secret access key. If not provided, will use `AWS_SECRET_ACCESS_KEY` environment variable or default AWS credentials.
 - **`apiKey`**: API key in format `"accessKeyId:secretAccessKey"`. Alternative to providing `accessKeyId` and `secretAccessKey` separately. If only one value is provided, it will be used as `accessKeyId` and `secretAccessKey` will be read from `AWS_SECRET_ACCESS_KEY` env var.
+- **`region`**: AWS region for Lambda invocation. Defaults to `process.env.AWS_REGION` or 'us-east-1'.
+
+#### For HTTP POST endpoints:
+- **`xApiKey`**: x-api-key header value. If not provided, will use `apiKey` parameter or `X_API_KEY` environment variable. **Required for HTTP endpoints**.
+- **`apiKey`**: Alternative to `xApiKey`. For HTTP endpoints, this value is used as the x-api-key header.
+
+#### Common parameters (both modes):
 - **`environment`**: Environment name (e.g., 'dev', 'prod', 'staging'). Defaults to `process.env.ENV` or 'unknown'.
 - **`source`**: Source system identifier. Defaults to 'Silicon Logger'.
-- **`region`**: AWS region for Lambda invocation. Defaults to `process.env.AWS_REGION` or 'us-east-1'.
 - **`getClientIp`**: Custom function to extract client IP from request context. Signature: `(requestContext) => string | null`
 - **`getGeolocation`**: Custom function to get geolocation from IP. Signature: `(ip, requestContext) => object | null`
 

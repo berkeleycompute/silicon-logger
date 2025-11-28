@@ -4,6 +4,9 @@
  */
 
 const crypto = require('crypto');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
 // Try to load AWS SDK v3 for Lambda (optional - will gracefully degrade if not available)
 let LambdaClient, InvokeCommand;
@@ -33,13 +36,14 @@ class Logger {
   /**
    * Create a new Logger instance
    * @param {object} config - Logger configuration
-   * @param {string} config.endpoint - Splunk Lambda ARN or endpoint URL
-   * @param {string} [config.accessKeyId] - AWS access key ID (optional, can use env var AWS_ACCESS_KEY_ID)
-   * @param {string} [config.secretAccessKey] - AWS secret access key (optional, can use env var AWS_SECRET_ACCESS_KEY)
-   * @param {string} [config.apiKey] - API key in format "accessKeyId:secretAccessKey" (alternative to separate params)
+   * @param {string} config.endpoint - Splunk Lambda ARN (e.g., "arn:aws:lambda:...") or HTTP POST URL (e.g., "https://...")
+   * @param {string} [config.accessKeyId] - AWS access key ID (for Lambda ARN, optional, can use env var AWS_ACCESS_KEY_ID)
+   * @param {string} [config.secretAccessKey] - AWS secret access key (for Lambda ARN, optional, can use env var AWS_SECRET_ACCESS_KEY)
+   * @param {string} [config.apiKey] - For Lambda: "accessKeyId:secretAccessKey" format. For HTTP URL: x-api-key header value
+   * @param {string} [config.xApiKey] - x-api-key header value for HTTP POST endpoints (alternative to apiKey for URLs)
    * @param {string} [config.environment] - Environment name (e.g., 'dev', 'prod')
    * @param {string} [config.source] - Source system identifier (default: 'Silicon Logger')
-   * @param {string} [config.region] - AWS region (default: 'us-east-1' or AWS_REGION env var)
+   * @param {string} [config.region] - AWS region (for Lambda ARN, default: 'us-east-1' or AWS_REGION env var)
    * @param {object} [config.event] - Lambda event object (optional, used for all logs in this instance)
    * @param {object} [config.context] - Lambda context object (optional, used for all logs in this instance)
    * @param {function} [config.getClientIp] - Custom function to extract client IP from request context
@@ -47,7 +51,7 @@ class Logger {
    */
   constructor(config) {
     if (!config || !config.endpoint) {
-      throw new Error('Logger requires an endpoint (Splunk Lambda ARN or URL)');
+      throw new Error('Logger requires an endpoint (Splunk Lambda ARN or HTTP POST URL)');
     }
 
     this.endpoint = config.endpoint;
@@ -61,21 +65,42 @@ class Logger {
     this.defaultEvent = config.event || null;
     this.defaultContext = config.context || null;
 
-    // AWS credentials - from constructor, apiKey, or environment variables
-    if (config.apiKey) {
-      // Parse apiKey in format "accessKeyId:secretAccessKey"
-      const parts = config.apiKey.split(':');
-      if (parts.length === 2) {
-        this.accessKeyId = parts[0];
-        this.secretAccessKey = parts[1];
+    // Detect if endpoint is an ARN or URL
+    this.isLambdaArn = this.endpoint.startsWith('arn:aws:lambda:');
+    this.isHttpUrl = this.endpoint.startsWith('http://') || this.endpoint.startsWith('https://');
+
+    if (!this.isLambdaArn && !this.isHttpUrl) {
+      throw new Error('Endpoint must be either a Lambda ARN (arn:aws:lambda:...) or an HTTP URL (http://... or https://...)');
+    }
+
+    // For HTTP URLs, use x-api-key
+    if (this.isHttpUrl) {
+      this.xApiKey = config.xApiKey || config.apiKey || process.env.X_API_KEY || null;
+      if (!this.xApiKey) {
+        throw new Error('HTTP endpoint requires x-api-key (provide via xApiKey, apiKey config, or X_API_KEY env var)');
+      }
+      // Clear AWS credentials for HTTP mode
+      this.accessKeyId = null;
+      this.secretAccessKey = null;
+    } else {
+      // For Lambda ARN, use AWS credentials
+      this.xApiKey = null;
+      // AWS credentials - from constructor, apiKey, or environment variables
+      if (config.apiKey) {
+        // Parse apiKey in format "accessKeyId:secretAccessKey"
+        const parts = config.apiKey.split(':');
+        if (parts.length === 2) {
+          this.accessKeyId = parts[0];
+          this.secretAccessKey = parts[1];
+        } else {
+          // Single value - treat as access key ID only
+          this.accessKeyId = config.apiKey;
+          this.secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
+        }
       } else {
-        // Single value - treat as access key ID only
-        this.accessKeyId = config.apiKey;
+        this.accessKeyId = config.accessKeyId || process.env.AWS_ACCESS_KEY_ID || null;
         this.secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
       }
-    } else {
-      this.accessKeyId = config.accessKeyId || process.env.AWS_ACCESS_KEY_ID || null;
-      this.secretAccessKey = config.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || null;
     }
 
     // Request-scoped sensitive paths storage
@@ -84,7 +109,7 @@ class Logger {
     // Request-scoped metadata storage (IP, geolocation, etc.)
     this.requestMetadataStore = new Map();
 
-    // Splunk Lambda client and configuration (lazy-loaded)
+    // Splunk Lambda client and configuration (lazy-loaded, only for Lambda ARN)
     this.splunkLambdaClient = null;
     this.splunkLambdaClientPromise = null;
   }
@@ -1022,34 +1047,97 @@ class Logger {
   }
 
   /**
-   * Send log entry to Splunk Lambda directly (fire-and-forget, non-blocking)
+   * Send log entry to Splunk endpoint (fire-and-forget, non-blocking)
+   * Supports both Lambda ARN (with AWS credentials) and HTTP POST URL (with x-api-key)
    * @param {object} logEntry - Log entry to send
    */
   sendToSplunkLambda(logEntry) {
     // Fire-and-forget - don't block the main execution
     (async () => {
       try {
-        const client = await this.getSplunkLambdaClient();
-        if (!client) {
-          return; // AWS SDK not available or credentials not configured
-        }
-
         // Transform log entry to Splunk format
         const splunkEntry = this.transformToSplunkFormat(logEntry);
 
-        // Send as single log (intake function can handle both single and batch)
-        const command = new InvokeCommand({
-          FunctionName: this.endpoint,
-          InvocationType: 'Event', // Asynchronous invocation (fire-and-forget)
-          Payload: JSON.stringify(splunkEntry),
-        });
+        if (this.isHttpUrl) {
+          // HTTP POST mode with x-api-key
+          await this.sendToHttpEndpoint(splunkEntry);
+        } else {
+          // Lambda ARN mode with AWS credentials
+          const client = await this.getSplunkLambdaClient();
+          if (!client) {
+            return; // AWS SDK not available or credentials not configured
+          }
 
-        await client.send(command);
+          // Send as single log (intake function can handle both single and batch)
+          const command = new InvokeCommand({
+            FunctionName: this.endpoint,
+            InvocationType: 'Event', // Asynchronous invocation (fire-and-forget)
+            Payload: JSON.stringify(splunkEntry),
+          });
+
+          await client.send(command);
+        }
       } catch (error) {
         // Log error but don't break the application if Splunk is down
-        console.error('Failed to send log to Splunk Lambda:', error.message);
+        console.error('Failed to send log to Splunk endpoint:', error.message);
       }
     })();
+  }
+
+  /**
+   * Send log entry to HTTP POST endpoint with x-api-key header
+   * @param {object} splunkEntry - Transformed log entry
+   * @returns {Promise<void>}
+   */
+  async sendToHttpEndpoint(splunkEntry) {
+    return new Promise((resolve, reject) => {
+      try {
+        const url = new URL(this.endpoint);
+        const isHttps = url.protocol === 'https:';
+        const httpModule = isHttps ? https : http;
+
+        const postData = JSON.stringify(splunkEntry);
+
+        const options = {
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname + url.search,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData),
+            'x-api-key': this.xApiKey,
+          },
+        };
+
+        const req = httpModule.request(options, (res) => {
+          // Consume response data to free up memory
+          res.on('data', () => {});
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve();
+            } else {
+              reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+            }
+          });
+        });
+
+        req.on('error', (error) => {
+          reject(error);
+        });
+
+        // Set a timeout to prevent hanging requests
+        req.setTimeout(5000, () => {
+          req.destroy();
+          reject(new Error('Request timeout'));
+        });
+
+        req.write(postData);
+        req.end();
+      } catch (error) {
+        reject(error);
+      }
+    });
   }
 
   /**
